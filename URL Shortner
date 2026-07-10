@@ -1,0 +1,350 @@
+# URL Shortener (Bit.ly) — Complete Study Guide
+
+> A comprehensive Q&A guide covering requirements gathering, API design, short code generation, HTTP redirects, caching, database indexing, scaling reads/writes, distributed counters, and high availability.
+> Designed for L1/L2 system design interviews (2-4 YOE backend engineers).
+
+---
+
+## Table of Contents
+
+1. [Requirements & Setup](#1-requirements--setup)
+2. [API Design](#2-api-design)
+3. [How HTTP Redirects Work](#3-how-http-redirects-work)
+4. [Short Code Generation](#4-short-code-generation)
+5. [Making Redirects Fast](#5-making-redirects-fast)
+6. [Scaling the System](#6-scaling-the-system)
+7. [Distributed Counter Problem](#7-distributed-counter-problem)
+8. [High Availability](#8-high-availability)
+
+---
+
+## 1. Requirements & Setup
+
+### Q: What does a URL shortener actually do?
+
+Two operations:
+
+1. **Write**: User gives a long URL → system returns a short one (`short.ly/abc123`)
+2. **Read**: Someone clicks the short URL → system redirects them to the original long URL
+
+The critical insight: reads dwarf writes by ~1000:1. One person creates a link, thousands click it. This asymmetry drives every architectural decision.
+
+### Q: What are the functional requirements?
+
+| Requirement | Priority |
+|-------------|----------|
+| Shorten a long URL → get short URL back | Core |
+| Custom alias (`short.ly/my-brand`) | Optional |
+| Expiration date on links | Optional |
+| Click short URL → redirect to original | Core |
+| Analytics, auth, accounts | Out of scope |
+
+### Q: What are the non-functional requirements?
+
+| Requirement | Target |
+|-------------|--------|
+| Short codes must be unique | No collisions ever |
+| Redirect latency | < 100ms |
+| Availability | 99.99% (favor availability over consistency) |
+| Scale | 1B URLs stored, 100M DAU |
+
+### Q: What are the core entities?
+
+- **Original URL** — the long thing
+- **Short URL** — the tiny thing (domain + short code)
+- **User** — who created the mapping
+
+### Q: Why does the short URL include a domain like `short.ly`?
+
+A URL cannot work without a domain — it's how the internet routes requests to the correct server. The domain tells the browser "send this request to short.ly's server." Without it, `abc123` is just a meaningless string with no destination.
+
+The shortening happens in two places: a short domain (`short.ly` = 8 chars vs `www.linkedin.com` = 18 chars) and a tiny path (`/abc123` vs `/in/evan-king-40072280/career-details`).
+
+---
+
+## 2. API Design
+
+### Q: What endpoints does a URL shortener need?
+
+Two REST endpoints:
+
+```
+POST /urls
+Body: { "long_url": "...", "custom_alias": "optional", "expiration_date": "optional" }
+Response: { "short_url": "http://short.ly/abc123" }
+
+GET /{short_code}
+Response: HTTP 302 Redirect → Location: https://original-long-url.com
+```
+
+POST for creation (creating a new resource). GET for redirect (reading an existing mapping).
+
+---
+
+## 3. How HTTP Redirects Work
+
+### Q: What happens when a user clicks a short URL?
+
+The redirect is completely automatic and invisible to the user:
+
+1. User clicks `short.ly/abc123` (or types it in address bar)
+2. Browser sends GET request to short.ly's server
+3. Server looks up `abc123` → finds the long URL
+4. Server responds with `302 Found` + `Location: https://linkedin.com/...`
+5. Browser **automatically** navigates to LinkedIn
+6. Address bar changes to the full LinkedIn URL
+
+The user never sees any intermediate page. It's like phone call forwarding — instant and invisible.
+
+### Q: Why 302 (temporary) instead of 301 (permanent)?
+
+| Status | Meaning | Browser Caches? | Server Sees Future Clicks? |
+|--------|---------|-----------------|---------------------------|
+| 301 | Moved Permanently | Yes — bypasses server next time | No |
+| 302 | Found (Temporary) | No — always hits server | Yes |
+
+302 wins because:
+- Keeps control over the link (can expire/update it later)
+- Prevents stale cached redirects if the link is deleted
+- Enables future analytics (every click passes through the server)
+
+### Q: What about expired URLs?
+
+If the short code exists but has passed its expiration date, return `410 Gone`. Run a background job periodically to clean up expired rows, and set cache TTL to match or be shorter than URL expiration times.
+
+---
+
+## 4. Short Code Generation
+
+### Q: What are the approaches to generating unique short codes?
+
+| Approach | Unique? | Short? | Fast? | Verdict |
+|----------|---------|--------|-------|---------|
+| Prefix truncation (first N chars of URL) | No | Yes | Yes | Useless |
+| Hash (SHA-256) + truncate to 8 chars | Mostly (retries needed) | Yes | Slower | Decent |
+| Atomic counter + base62 encode | Always | Yes (6-7 chars for billions) | Yes | Best |
+
+### Q: How does the hash approach work?
+
+```
+input_url = "https://example.com/long/url"
+hash_code = SHA256(input_url)        → deterministic fixed-size output
+encoded   = base62_encode(hash_code) → compact alphanumeric string
+short_code = encoded[:8]             → first 8 characters
+```
+
+Problem: two different URLs could produce the same 8-character prefix (collision). Need a UNIQUE constraint in DB and retry with a salt on collision (max 3-5 retries).
+
+### Q: How does the counter approach work?
+
+Keep a global counter (in Redis). Every new URL gets the next number, base62-encoded:
+
+```
+Counter = 1,000,000,000
+base62(1000000000) = "15ftgG" → 6 characters
+```
+
+Zero collisions by definition. Redis `INCR` is atomic and single-threaded — two simultaneous requests always get different values.
+
+### Q: Why base62 encoding?
+
+Base62 uses `a-z`, `A-Z`, `0-9` (62 characters). It's compact (represents large numbers in few characters) and URL-safe. We skip `+` and `/` from base64 because `/` is a URL path separator and `+` can mean "space" in query strings.
+
+### Q: How short can codes stay with 1 billion URLs?
+
+`base62(1,000,000,000)` = `"15ftgG"` — just 6 characters. At `62^6` (~56 billion URLs) you'd move to 7 characters, and `62^7` gives 3.5 trillion. Short codes stay compact even at massive scale.
+
+---
+
+## 5. Making Redirects Fast
+
+### Q: Why can't we just query the database directly?
+
+Without optimization, looking up `abc123` in a billion rows means a full table scan — checking every single row. With 100M DAU doing ~5 redirects each, that's ~600K reads/sec at peak. A single database instance with full scans can't keep up.
+
+### Q: What does database indexing do?
+
+A B-tree index on the `short_code` column (or making it the primary key) gives O(log n) lookups instead of O(n) full scans. Like looking up a word in a dictionary by jumping to the right section, instead of reading every page from page 1.
+
+### Q: Why add a cache on top of indexing?
+
+Even with indexes, disk access is ~1000x slower than memory:
+
+| Storage | Access Time | Ops/Second |
+|---------|-------------|------------|
+| Memory (Redis/Memcached) | 0.0001 ms | Millions |
+| SSD (indexed DB) | 0.1 ms | ~100,000 |
+| HDD | 10 ms | ~100 |
+
+Most short URLs follow the Pareto principle — 20% of links get 80% of clicks. An LRU cache stores hot URLs in memory. Cache hit → instant response. Cache miss → query DB → cache the result for next time.
+
+### Q: What about CDNs?
+
+Deploy redirect logic to CDN edge nodes (Cloudflare Workers, Lambda@Edge). Popular short codes get resolved geographically close to the user, never hitting the origin server. Tradeoff: more cost and complexity for lower latency. Worth it at Bit.ly scale, overkill for a startup.
+
+---
+
+## 6. Scaling the System
+
+### Q: How big is the database?
+
+```
+Per row: ~500 bytes (short code + long URL + metadata)
+1 billion rows × 500 bytes = 500 GB
+```
+
+A single Postgres instance on a modern SSD handles this. No sharding needed.
+
+### Q: What about write throughput?
+
+~100K new URLs/day ≈ 1 write/second. Trivial. Any database handles this.
+
+### Q: What about read throughput?
+
+```
+100M DAU × 5 redirects/user = 500M redirects/day
+Average: 500M ÷ 86,400 ≈ 5,800/sec
+Peak (100x spike): ~600K reads/sec
+```
+
+This is why the cache layer is critical. Redis handles millions of reads/sec.
+
+### Q: How do you scale the servers?
+
+Split into two services:
+- **Read Service** — handles redirects, stateless, scales horizontally
+- **Write Service** — creates short URLs, lighter load, scales independently
+
+This separation lets you throw more instances at the bottleneck (reads) without over-provisioning writes.
+
+---
+
+## 7. Distributed Counter Problem
+
+### Q: What's the problem with multiple Write Service instances?
+
+If you have 5 Write Servers all using the same counter, they need to agree on the next value. Without coordination, two servers might grab the same number → collision.
+
+### Q: How does a centralized Redis counter solve it?
+
+Redis is single-threaded with atomic `INCR`. Two simultaneous calls always get different values (one gets 1000, the other gets 1001). All Write Servers ask the same Redis instance for the next number.
+
+### Q: What is counter batching?
+
+Instead of asking Redis for one number per URL, grab a chunk:
+
+```
+Server A → Redis: "Give me 1000 numbers"
+Redis → Server A: "5000–5999 are yours" (counter jumps to 6000)
+
+Server B → Redis: "Give me 1000 numbers"
+Redis → Server B: "6000–6999 are yours"
+```
+
+Server A now creates 1000 URLs locally (5000, 5001, 5002...) without any network calls. Only asks Redis again when the batch is exhausted.
+
+Analogy: A box office gives each ticket seller a roll of 1000 pre-numbered tickets. They sell from their roll without checking in. When the roll is empty, they get a new one.
+
+### Q: How does multi-region work?
+
+Give each region a non-overlapping range of numbers:
+
+```
+US Region: numbers 0 to 999,999,999 (0 to 1B)
+EU Region: numbers 1,000,000,000 to 1,999,999,999 (1B to 2B)
+```
+
+Each region has its own local Redis counter that only counts within its assigned range. No cross-ocean communication needed. Like two DMV offices issuing license plates from completely different series — they never collide.
+
+### Q: What if a server crashes with unused numbers in its batch?
+
+Those numbers are wasted — and that's fine. The system needs uniqueness, not continuity. Skipping a few numbers is harmless when you have billions available.
+
+---
+
+## 8. High Availability
+
+### Q: What if the database goes down?
+
+| Strategy | What It Does |
+|----------|--------------|
+| DB Replication (Postgres replicas) | Multiple copies of data; automatic failover |
+| Periodic Backups | Snapshots stored separately for disaster recovery |
+| Redis Sentinel / Cluster | Auto-failover for the counter service |
+| Stateless services + load balancer | Any server instance handles any request |
+
+### Q: What's the ultimate safety net for uniqueness?
+
+The database's UNIQUE constraint on the `short_code` column. Even if something goes wrong with the counter (Redis blip, lost batch), an insertion attempt with a duplicate code will fail with an error rather than creating a collision. Catch the error → retry with next number.
+
+---
+
+## Interview-Ready One-Liners
+
+### "How would you design a URL shortener?"
+> "It's a read-heavy lookup service. I'd use an atomic Redis counter with base62 encoding for collision-free code generation, a Redis cache layer to absorb the 1000:1 read-to-write ratio, and 302 redirects to keep control over link lifecycle."
+
+### "How do you ensure short codes are unique?"
+> "Atomic counter in Redis — every increment is unique by definition. Base62 encode it for compactness. The DB has a UNIQUE constraint as the safety net."
+
+### "How do you handle scale?"
+> "Split read and write services. Reads are served from an LRU cache (Redis). Writes use counter batching — each server grabs 1000 numbers at once to minimize Redis calls. For multi-region, assign disjoint counter ranges."
+
+### "301 or 302 for redirects?"
+> "302. It keeps every click flowing through our server, prevents stale browser caches, and lets us expire or update links without users being stuck on a cached 301."
+
+---
+
+## Quick Reference: URL Shortener Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        WRITE PATH                                │
+│                                                                  │
+│  Client → POST /urls → Write Service → Redis Counter (batched)  │
+│                              ↓                                   │
+│                        Database (store mapping)                   │
+│                              ↓                                   │
+│                        Return short URL                           │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                        READ PATH                                 │
+│                                                                  │
+│  Click short.ly/abc123 → Read Service → Redis Cache             │
+│                                          ↓ HIT? → 302 Redirect  │
+│                                          ↓ MISS?                 │
+│                                        Database → cache it       │
+│                                          ↓                       │
+│                                      302 Redirect                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Final Mental Models
+
+| Concept | Mental Model |
+|---------|--------------|
+| URL shortener | Phone call forwarding — caller dials short number, gets routed to real number invisibly |
+| Base62 encoding | License plate system — compact representation of large numbers using letters + digits |
+| HTTP 302 redirect | "I moved, here's my new address" note on old mailbox — mail carrier forwards automatically |
+| Database index | Library card catalog — find the book without scanning every shelf |
+| Redis cache | Speed dial — frequently called numbers stored in memory for instant access |
+| Counter batching | Roll of pre-numbered raffle tickets — use locally, get a new roll when empty |
+| Multi-region ranges | Two DMV offices with non-overlapping plate series — never need to coordinate |
+| Read-to-write ratio | One person prints flyers, 1000 people read them — optimize for the readers |
+
+---
+
+## What's Next (Recommended Topics)
+
+1. **Rate Limiting** — How to prevent abuse (someone generating millions of short URLs)
+2. **Consistent Hashing** — How to distribute data across multiple database shards
+3. **Database Replication** — Leader-follower vs multi-leader, replication lag tradeoffs
+4. **CDN & Edge Computing** — How Cloudflare Workers / Lambda@Edge actually work
+5. **Designing a Paste Service (Pastebin)** — Similar pattern, different storage requirements
+
+---
+
+*Created from a deep-dive study session on URL shortener system design. Designed for L1/L2 system design interviews (2-4 YOE backend engineers).*
