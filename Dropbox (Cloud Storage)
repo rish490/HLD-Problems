@@ -1,0 +1,474 @@
+# Dropbox (File Storage & Sync) — Complete Study Guide
+
+> A comprehensive Q&A guide covering file upload/download architecture, presigned URLs, chunked uploads, cross-device sync, file sharing, CDN-based delivery, and security.
+> Designed for L1/L2 system design interviews (2-4 YOE backend engineers).
+
+---
+
+## Table of Contents
+
+1. [Requirements & CAP Trade-off](#1-requirements--cap-trade-off)
+2. [Core Entities & API Design](#2-core-entities--api-design)
+3. [File Upload Architecture](#3-file-upload-architecture)
+4. [File Download Architecture](#4-file-download-architecture)
+5. [File Sharing](#5-file-sharing)
+6. [Cross-Device Sync](#6-cross-device-sync)
+7. [Large File Support (Chunking)](#7-large-file-support-chunking)
+8. [Performance Optimizations](#8-performance-optimizations)
+9. [Security](#9-security)
+10. [Final Architecture](#10-final-architecture)
+
+---
+
+## 1. Requirements & CAP Trade-off
+
+### Q: What are the functional requirements?
+
+Four core features:
+- Upload a file from any device
+- Download a file from any device
+- Share a file with other users
+- Auto-sync files across devices
+
+Out of scope: file editing, in-browser previewing, versioning, virus scanning, storage limits.
+
+### Q: Why pick availability over consistency?
+
+For a file storage system, it's acceptable if a user in Germany uploads a file and a user in the US can't see it for a few seconds. Nobody loses money or has a safety issue from stale reads.
+
+You only pick consistency over availability when every read MUST see the most recent write or the system breaks (e.g., stock trading, banking).
+
+### Q: What non-functional requirements matter?
+
+| Requirement | Target |
+|-------------|--------|
+| Availability | High (AP system) |
+| Max file size | 50GB |
+| Reliability | Recoverable if files lost/corrupted |
+| Latency | Upload, download, and sync as fast as possible |
+
+---
+
+## 2. Core Entities & API Design
+
+### Q: What are the core entities?
+
+| Entity | What it is | Example |
+|--------|-----------|---------|
+| File | Raw bytes | A 2GB video, a 50KB PDF |
+| FileMetadata | Info about the file | name, size, mimeType, uploadedBy, status |
+| User | Person using the system | email, userId |
+
+### Q: What do the APIs look like?
+
+| Action | Endpoint | Notes |
+|--------|----------|-------|
+| Upload | `POST /files/presigned-url` | Returns presigned URL for direct S3 upload |
+| Download | `GET /files/{fileId}/presigned-url` | Returns signed CDN URL |
+| Share | `POST /files/{fileId}/share` | Body: list of user IDs/emails |
+| Sync check | `GET /files/changes?since={timestamp}` | Returns ChangeEvent[] |
+
+User identity comes from headers (JWT or session token) — never the request body, since body can be tampered with.
+
+APIs evolve as you design. Tell the interviewer upfront: "I'll outline simple APIs but may refine them as we go deeper."
+
+---
+
+## 3. File Upload Architecture
+
+### Q: What are the three approaches and why does the third one win?
+
+| Approach | How it works | Problem |
+|----------|-------------|---------|
+| Store on server disk | Client → Server (stores locally) | Doesn't scale, single point of failure |
+| Server forwards to S3 | Client → Server → S3 | File travels twice, server becomes bottleneck |
+| **Direct to S3 via presigned URL** | Client → Server (get URL) → Client → S3 | Winner. Server never touches file bytes. |
+
+### Q: What's the exact flow for the presigned URL approach?
+
+```
+1. Client → Server:  "I want to upload report.pdf (15MB, application/pdf)"
+2. Server:           Saves metadata to DB (status: "uploading"), generates presigned URL
+3. Server → Client:  Returns the presigned URL
+4. Client → S3:      PUT request directly to that URL with file bytes
+5. S3 → Server:      S3 Event Notification says "upload complete"
+6. Server:           Updates metadata in DB (status: "uploaded")
+```
+
+### Q: What exactly does the server receive — the file or just metadata?
+
+Only metadata. The request is a tiny JSON payload (~200 bytes):
+
+```json
+{
+  "fileName": "report.pdf",
+  "fileSize": 15000000,
+  "mimeType": "application/pdf"
+}
+```
+
+The server never sees the actual file bytes. It just generates a cryptographically signed URL using AWS credentials — a purely local math operation with no network call to S3.
+
+### Q: What is a presigned URL?
+
+A time-limited, cryptographically signed URL that grants temporary permission to perform a specific action (PUT or GET) on a specific S3 object — without needing AWS credentials on the client.
+
+Key properties:
+- Generated server-side using AWS credentials (local crypto, no S3 call)
+- Typically expires in 5-15 minutes
+- Scoped to one specific file path and one HTTP method
+- Bearer token — anyone with the URL can use it until it expires
+
+### Q: Why not just upload to the server and let it forward to S3?
+
+The file would travel twice over the network:
+
+| Issue | Direct to S3 | Via Server |
+|-------|-------------|-----------|
+| Bandwidth cost | Pay once | Pay twice |
+| Upload time | 1x | ~2x |
+| Server CPU/memory | Near zero (just signs a URL) | Must buffer/stream entire file |
+| Scalability | S3 handles thousands of parallel uploads natively | Server becomes the bottleneck |
+| Servers needed | Few (lightweight metadata work) | Many (streaming GBs of data) |
+
+If 1,000 users upload 1GB files simultaneously:
+- **Direct to S3**: Server handles 1,000 tiny presigned URL requests (~1ms each). S3 absorbs 1TB.
+- **Via server**: Server must receive AND forward 1TB. You'd need dozens of beefy servers just to relay bytes.
+
+The server should be a **traffic cop**, not a **cargo truck**.
+
+### Q: When WOULD you route through the server?
+
+- Virus scanning (need to inspect bytes before storing)
+- Transcoding/processing (e.g., generating thumbnails)
+- Client can't reach S3 (restrictive corporate firewalls)
+- Very small files (<1MB) where presigned URL roundtrip is proportionally expensive
+
+---
+
+## 4. File Download Architecture
+
+### Q: What are the three download approaches?
+
+| Approach | Latency (user in Tokyo, S3 in us-east-1) |
+|----------|------------------------------------------|
+| Server proxy (S3 → Server → Client) | ~400ms + transfer time |
+| Direct S3 presigned URL | ~200ms + transfer time |
+| **CDN signed URL** | ~20ms + transfer time |
+
+### Q: How does the CDN approach work?
+
+1. Client asks server: `GET /files/{fileId}/presigned-url`
+2. Server generates a CDN signed URL (CloudFront)
+3. Client downloads from nearest CDN edge location
+4. On first request (cache miss): CDN fetches from S3, caches it
+5. On subsequent requests (cache hit): CDN serves directly from edge
+
+### Q: Do downloads need chunking like uploads?
+
+No. Downloads are much simpler because:
+
+- Once `CompleteMultipartUpload` is called, S3 stores a **single assembled object**
+- Downloads use one URL for the whole file
+- HTTP **Range Requests** handle resumability natively
+
+| Concern | Upload | Download |
+|---------|--------|----------|
+| Chunking | Required (API Gateway has 10MB limit) | Not needed — HTTP Range handles it |
+| Resumability | Track chunk status in metadata DB | Send `Range: bytes={offset}-` header |
+| Progress tracking | Custom per-chunk tracking | Browser/client handles automatically |
+| Metadata updates | Status: uploading → uploaded | No status tracking needed |
+| Parallel transfer | Upload multiple chunks in parallel | Request multiple byte ranges in parallel |
+
+If a 2GB download fails at byte 500MB, the client simply resumes:
+```
+GET https://cdn.example.com/files/abc123
+Range: bytes=524288000-
+```
+
+No chunk fingerprints, no metadata DB updates, no server coordination.
+
+---
+
+## 5. File Sharing
+
+### Q: What's the challenge with file sharing?
+
+When a user opens Dropbox, they need to see:
+1. Their own files (easy — query by `uploadedBy`)
+2. Files shared WITH them (this is the design question)
+
+### Q: What are the approaches?
+
+| Approach | Query for "files shared with me" | Downside |
+|----------|----------------------------------|----------|
+| Sharelist in file metadata | Full table scan of every file's sharelist | Brutally slow at scale |
+| Denormalized cache (user → fileIds) | O(1) lookup | Dual-write consistency problem |
+| **Normalized SharedFiles table** | Query by partition key | Slightly slower than cache, no sync headaches |
+
+### Q: How does the SharedFiles table work?
+
+```
+| userId (Partition Key) | fileId (Sort Key) |
+|------------------------|-------------------|
+| user1                  | fileId1           |
+| user1                  | fileId2           |
+| user2                  | fileId3           |
+```
+
+In DynamoDB: `userId` = partition key, `fileId` = sort key. Getting all files shared with user1 = one query on the partition key. No dual-write consistency issues since we no longer maintain a separate sharelist field.
+
+---
+
+## 6. Cross-Device Sync
+
+### Q: How does Local → Remote sync work?
+
+A sync agent on the user's machine:
+1. Watches the Dropbox folder using OS file-system events (FSEvents on macOS, FileSystemWatcher on Windows)
+2. Detects changes, queues modified files for upload
+3. Uses the upload API to push changes to S3
+4. Conflict resolution: last write wins
+
+### Q: How does Remote → Local sync work?
+
+| Method | Pros | Cons |
+|--------|------|------|
+| Polling | Simple, reliable | Slow to detect changes, wastes bandwidth |
+| WebSocket/SSE push | Real-time | Connections drop, messages get lost |
+| **Hybrid (both)** | Real-time + reliable | Slightly more complex |
+
+The hybrid approach:
+- **WebSocket** pushes change events in real-time (one connection per device, not per file)
+- **Periodic polling** (every few minutes) using `GET /files/changes?since={timestamp}` catches anything the WebSocket missed
+
+---
+
+## 7. Large File Support (Chunking)
+
+### Q: Why can't you upload a 50GB file in one request?
+
+- **Timeout**: 50GB at 100Mbps = ~1.1 hours. HTTP connections will time out.
+- **Gateway limits**: AWS API Gateway caps at 10MB per request (hard limit).
+- **No resumability**: WiFi drops at 49GB? Start over.
+- **No progress bar**: User stares at a spinner for an hour.
+
+### Q: How does chunked/multipart upload work?
+
+1. Client splits file into 5-10MB chunks, calculates SHA-256 fingerprint for each chunk and the whole file
+2. Client asks backend: "Has this file (by fingerprint) been partially uploaded before?"
+3. If new: backend calls S3's `CreateMultipartUpload` → gets `uploadId`, generates presigned URL per chunk
+4. Client uploads chunks in parallel using individual presigned URLs
+5. After each chunk: client notifies backend → backend verifies with S3's `ListParts` → updates metadata
+6. Once all chunks done: backend calls `CompleteMultipartUpload` → S3 assembles the file
+7. File status → "uploaded"
+
+### Q: How does resumability work?
+
+The FileMetadata stores chunk status:
+
+```json
+{
+  "id": "123",
+  "name": "big-video.mp4",
+  "status": "uploading",
+  "chunks": [
+    { "id": "chunk1", "status": "uploaded" },
+    { "id": "chunk2", "status": "uploaded" },
+    { "id": "chunk3", "status": "not-uploaded" }
+  ]
+}
+```
+
+On resume: client checks fingerprint → finds partial upload → skips completed chunks → resumes from chunk3.
+
+### Q: What's a fingerprint and why do we need it?
+
+A SHA-256 hash of the file's content that uniquely identifies it regardless of filename. Two users uploading the same file produce the same fingerprint.
+
+Used for:
+- **Deduplication**: "Has this exact file been uploaded before?"
+- **Resumability**: "Is there a partial upload matching this fingerprint?"
+
+The `fileId` in metadata is a UUID (unique per record). The fingerprint is a separate field for content identification.
+
+---
+
+## 8. Performance Optimizations
+
+### Q: What are all the ways to make uploads/downloads faster?
+
+| Technique | Helps with | How |
+|-----------|-----------|-----|
+| CDN | Downloads | Cache at edge, serve from nearest POP |
+| Parallel chunk upload | Uploads | Multiple chunks in flight simultaneously |
+| Content-Defined Chunking (CDC) | Sync | Only re-upload chunks that actually changed |
+| Compression (Zstandard) | Both | Fewer bytes to transfer |
+| Adaptive chunk sizing | Uploads | Bigger chunks on fast networks, smaller on slow |
+
+### Q: What is Content-Defined Chunking and why does it matter?
+
+With fixed-size chunks (every 5MB), inserting ONE byte at the start shifts ALL chunk boundaries. Every chunk fingerprint changes. You'd re-upload the entire file for a 1-byte edit.
+
+**CDC** uses a rolling hash (Rabin fingerprinting) to determine chunk boundaries based on content. Insert a byte? Only 1-2 surrounding chunks change. The other 99 chunks keep their fingerprints.
+
+This is how real Dropbox achieves efficient delta sync.
+
+### Q: When should you compress files?
+
+| File type | Compress? | Why |
+|-----------|-----------|-----|
+| Text files, logs, CSVs | Yes | 5GB → 500MB possible |
+| Images (PNG, JPEG) | No | Already compressed, <2% savings |
+| Videos (MP4) | No | Already compressed |
+| Archives (ZIP) | No | Already compressed |
+
+Algorithm comparison:
+- **Gzip**: Most widely supported, moderate speed/ratio
+- **Brotli**: Better ratio than Gzip for text, supported by all modern browsers
+- **Zstandard**: Best balance of speed + ratio, tunable, ideal for client-side work
+
+Rule: Always compress BEFORE encrypting (encryption adds randomness that makes compression useless).
+
+---
+
+## 9. Security
+
+### Q: What are the three layers of security?
+
+| Layer | What | How |
+|-------|------|-----|
+| In transit | Data moving client ↔ server ↔ S3 | HTTPS (TLS) everywhere |
+| At rest | Data sitting in S3 | S3 Server-Side Encryption (SSE-S3 or SSE-KMS) |
+| Access control | Who can download what | SharedFiles table + signed URLs with short expiry |
+
+### Q: How do signed URLs prevent unauthorized access?
+
+Even if an authorized user leaks a download link:
+- Signed URLs expire quickly (5 minutes)
+- CloudFront validates the signature using the registered public key
+- Expired or invalid signature → 403 Forbidden
+
+The flow:
+1. Server generates URL signed with private key (includes path, expiration, optional IP restriction)
+2. Client uses URL to request from CDN
+3. CDN validates signature with public key, checks expiration
+4. Valid + unexpired → serve file. Otherwise → deny.
+
+Limitation: Signed URLs are bearer tokens — anyone with a valid, unexpired URL can use it. For high-security: add IP binding or require authentication cookies alongside the URL.
+
+---
+
+## 10. Final Architecture
+
+```
+┌──────────┐     ┌──────────┐
+│  Uploader │     │Downloader│
+│  (Client) │     │ (Client) │
+└────┬──────┘     └─────┬────┘
+     │                   │
+     │  presigned URLs   │  CDN signed URLs
+     ▼                   ▼
+┌─────────────────────────────┐
+│   LB & API Gateway          │
+└─────────────┬───────────────┘
+              │
+              ▼
+┌─────────────────────────────┐
+│      File Service            │  ← generates presigned URLs, manages metadata
+└──────┬──────────────┬───────┘
+       │              │
+       ▼              ▼
+┌────────────┐  ┌──────────┐
+│ Metadata DB│  │    S3    │  ← actual file bytes
+│ (DynamoDB) │  └────┬─────┘
+└────────────┘       │
+                     ▼
+               ┌──────────┐
+               │    CDN   │  ← cached at edge for fast downloads
+               └──────────┘
+```
+
+**Component responsibilities:**
+
+| Component | Role |
+|-----------|------|
+| File Service | Control plane — generates presigned URLs, manages metadata. Never touches file bytes. |
+| Metadata DB (DynamoDB) | Stores file metadata, chunk status, SharedFiles table |
+| S3 | Stores actual file bytes. Handles scaling, durability, multipart assembly. |
+| CDN (CloudFront) | Caches files at edge locations for fast downloads worldwide |
+| LB & API Gateway | Routing, SSL termination, rate limiting, request validation |
+
+---
+
+## Interview-Ready One-Liners
+
+### "Why use presigned URLs instead of uploading through your server?"
+> "The server should be a traffic cop, not a cargo truck. Presigned URLs let the client upload directly to S3 — the server just generates a signed permission slip using local crypto, never touching the file bytes. This eliminates double bandwidth cost and prevents the server from being a bottleneck."
+
+### "How do you handle a 50GB upload?"
+> "Chunked multipart upload. Client splits into 5-10MB chunks, uploads each directly to S3 via individual presigned URLs (in parallel), and the backend tracks chunk status for resumability. S3's CompleteMultipartUpload assembles the final object."
+
+### "Why don't downloads need chunking?"
+> "Once multipart upload completes, S3 stores a single assembled object. Downloads use one signed URL plus HTTP Range requests for resumability — it's built into the protocol, no custom chunking needed."
+
+### "How do you keep files in sync across devices?"
+> "Hybrid approach: WebSocket pushes real-time change events, plus periodic polling as a safety net to catch anything missed during connection drops."
+
+### "Why availability over consistency for Dropbox?"
+> "Nobody loses money or has a safety issue if a file takes 3 seconds to appear on another device. Availability matters more — users should always be able to upload and access their files."
+
+---
+
+## Quick Reference: Upload Decision Tree
+
+```
+User wants to upload a file
+│
+├─ File < 10MB?
+│   └─ Single presigned URL PUT → done
+│
+├─ File 10MB - 50GB?
+│   └─ Chunked multipart upload:
+│       ├─ Calculate file + chunk fingerprints
+│       ├─ Check for existing partial upload (resumability)
+│       ├─ Get presigned URL per chunk
+│       ├─ Upload chunks in parallel
+│       ├─ Backend verifies each with ListParts
+│       └─ CompleteMultipartUpload → assembled
+│
+└─ Compress first?
+    ├─ Text/CSV/logs → Yes (Zstandard)
+    ├─ Images/video → No (already compressed)
+    └─ Encrypting after? → Always compress BEFORE encrypt
+```
+
+---
+
+## Final Mental Models
+
+| Concept | Mental Model |
+|---------|--------------|
+| Presigned URL | A one-time-use badge that lets you into the warehouse yourself. Expires in 15 minutes. |
+| Server's role | Traffic cop, not cargo truck. Directs traffic, never carries the load. |
+| Chunked upload | Shipping a car in parts — if one crate is lost, re-ship only that crate |
+| CDN | Mini-warehouses worldwide. Popular items pre-stocked at your nearest location. |
+| Content-Defined Chunking | Cutting a book at chapter boundaries (content-based) vs every 50 pages (fixed). Edit one chapter, only that section changes. |
+| Fingerprint (SHA-256) | A DNA test for files — identifies content regardless of filename |
+| Hybrid sync | Friend texts you new photos (WebSocket) + you check Instagram every evening just in case (polling) |
+| Signed URL security | A movie ticket with your name, seat number, and showtime. Expired? Can't get in. Wrong name? Can't get in. |
+| Download resumability | HTTP Range requests = "I already have pages 1-500, just send me 501 onwards" |
+
+---
+
+## What's Next (Recommended Topics)
+
+1. **Google Drive** — adds real-time collaborative editing (OT/CRDT algorithms)
+2. **Blob Storage internals** — how S3 actually works under the hood (erasure coding, consistent hashing)
+3. **CDN Design** — designing a content delivery network from scratch (anycast, cache invalidation, origin shielding)
+4. **Notification System** — the WebSocket/SSE push infrastructure in detail (connection management, fan-out)
+5. **Distributed File Systems** — GFS/HDFS for when you need to process files, not just store them
+
+---
+
+*Created from a deep-dive study session on Dropbox/file storage system design. Designed for L1/L2 system design interviews (2-4 YOE).*
