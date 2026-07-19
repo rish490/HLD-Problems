@@ -1,0 +1,431 @@
+# Rate Limiter — Study Guide
+
+> Rate limiter system design for social media API (1M rps, 100M DAU, <10ms overhead). L1/L2 interview prep.
+
+---
+
+## Table of Contents
+
+1. [Problem & Requirements](#1-problem--requirements)
+2. [Entities & Interface](#2-entities--interface)
+3. [Placement](#3-placement)
+4. [Client Identification](#4-client-identification)
+5. [Algorithms](#5-algorithms)
+6. [Token Bucket in Detail](#6-token-bucket-in-detail)
+7. [Race Conditions & Lua Fix](#7-race-conditions--lua-fix)
+8. [The 429 Response](#8-the-429-response)
+9. [Scaling to 1M RPS](#9-scaling-to-1m-rps)
+10. [High Availability](#10-high-availability)
+11. [Latency Optimizations](#11-latency-optimizations)
+12. [Hot Keys](#12-hot-keys)
+13. [Dynamic Rule Config](#13-dynamic-rule-config)
+14. [Real-World Setup](#14-real-world-setup)
+15. [Interview One-Liners](#15-interview-one-liners)
+16. [Decision Cheat Sheet](#16-decision-cheat-sheet)
+17. [Mental Models](#17-mental-models)
+18. [What's Next](#18-whats-next)
+
+---
+
+## 1. Problem & Requirements
+
+### Q: What is a rate limiter?
+
+A bouncer for your API. Counts requests per client per window; rejects excess with HTTP 429. Purpose: prevent abuse, protect servers, ensure fair usage.
+
+### Q: Why server-side, not client-side?
+
+Clients can't be trusted. Client-side is a courtesy for well-behaved apps; server-side is the actual enforcement.
+
+### Q: What are the requirements?
+
+| Type | Requirement |
+|------|-------------|
+| Functional | Identify clients (user ID / IP / API key), enforce configurable rules, return 429 with headers |
+| Non-functional | <10ms overhead, 1M rps, 100M DAU, high availability, eventual consistency OK |
+
+### Q: Why is eventual consistency acceptable?
+
+Because this is social media, not banking. Letting 5 extra tweets through costs nothing. For payments you'd need strong consistency (distributed locks or single-leader routing).
+
+---
+
+## 2. Entities & Interface
+
+### Q: What are the three entities?
+
+| Entity | Definition | Example |
+|--------|-----------|---------|
+| Rule | The policy | "10/min per user on POST /tweets" |
+| Client | Who's limited | `user_42`, IP `1.2.3.4`, `api_key_xyz` |
+| Request | The incoming call | `POST /tweets` at timestamp |
+
+### Q: What's the API?
+
+```
+isRequestAllowed(clientId, ruleId) → { passes, remaining, resetTime }
+```
+
+Runs as gateway middleware **before** the request reaches app servers. `remaining` and `resetTime` map to `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers.
+
+---
+
+## 3. Placement
+
+### Q: Where should the rate limiter live?
+
+| Option | Verdict | Problem |
+|--------|---------|---------|
+| In-process (in every app server) | ❌ | Each server sees only its slice → global limits break |
+| Dedicated microservice | ❌ | Extra network hop = latency + failure point |
+| **API Gateway** | ✅ | Front-door protection, already in the request path |
+
+Trade-off with gateway: only sees HTTP-level info. Deep business logic needs JWT claims or a downstream service.
+
+---
+
+## 4. Client Identification
+
+### Q: How do we identify clients?
+
+| Identifier | Header | Use case |
+|-----------|--------|----------|
+| User ID | JWT in `Authorization` | Authenticated APIs (best signal) |
+| IP | `X-Forwarded-For` | Anonymous APIs |
+| API Key | `X-API-Key` | Developer APIs |
+
+### Q: How are multiple rules combined?
+
+Stack them and enforce the **most restrictive**:
+
+- Per-user: "Alice: 1000/hour"
+- Per-IP: "This IP: 100/min"
+- Global: "50k rps total"
+- Per-endpoint: "Search: 10/min"
+
+If Alice is fine per-user but her IP hit the IP limit, she's blocked.
+
+---
+
+## 5. Algorithms
+
+### Q: What are the four algorithms and how do they compare?
+
+| Algorithm | Memory | Accuracy | Handles bursts? | Notes |
+|-----------|--------|----------|-----------------|-------|
+| Fixed Window | Tiny (1 int) | Bad | No | **Boundary burst**: 100 requests at 12:00:59 + 100 at 12:01:00 = 200 in 2 sec |
+| Sliding Window Log | Huge (N/user) | Perfect | Yes | Memory explodes at scale |
+| Sliding Window Counter | Tiny (2 ints) | Good approx | Yes | Weighted math over previous + current window |
+| **Token Bucket** ✅ | Tiny (2 fields) | Great | Yes | Chosen by Stripe. Bucket size = burst; refill rate = sustained rate |
+
+### Q: Why Token Bucket?
+
+Two intuitive knobs (bucket size, refill rate). Naturally handles bursty API traffic. Tiny per-user memory.
+
+---
+
+## 6. Token Bucket in Detail
+
+### Q: What state do we store?
+
+```
+alice:bucket = { tokens: 47, last_refill: 1689012400 }
+```
+
+Plus config per rule: `MAX_CAPACITY` (bucket size), `REFILL_RATE` (tokens/sec).
+
+### Q: How does refill work — is there a background job?
+
+**No.** Refill is computed lazily on read. A background job for 100M users would be insane.
+
+Formula on each request:
+
+```
+elapsed       = now - last_refill
+tokens_to_add = elapsed × REFILL_RATE
+new_tokens    = min(tokens + tokens_to_add, MAX_CAPACITY)  ← clamp is critical
+```
+
+Then: if `new_tokens >= 1` → subtract 1, ALLOW. Else REJECT.
+
+### Q: Why is the `min()` clamp critical?
+
+Without it, an idle user accumulates unbounded tokens and can dump millions of requests at once, defeating the whole purpose.
+
+---
+
+## 7. Race Conditions & Lua Fix
+
+### Q: What's the race condition?
+
+Alice has 1 token left. Two concurrent requests hit Gateway A and Gateway B:
+
+```
+A: HMGET → tokens=1
+B: HMGET → tokens=1     ← both read the same state
+A: allow, HSET tokens=0
+B: allow, HSET tokens=0
+
+Result: 2 requests allowed on 1 token.
+```
+
+Read and write are separate ops; computation happens on the gateway in between.
+
+### Q: Why doesn't MULTI/EXEC fix it?
+
+MULTI/EXEC is a batch, not a transaction. The gateway still has to read, decide on itself, then queue the write. The gap remains.
+
+### Q: How do Lua scripts fix it?
+
+Redis runs Lua scripts **atomically and single-threadedly** — no other command interleaves. Ship the entire read-compute-write into one script:
+
+```lua
+local tokens = get current tokens
+tokens = min(tokens + elapsed × rate, MAX)
+if tokens >= 1 then allow, tokens -= 1
+else reject
+write back
+```
+
+Gateway calls `EVAL <script>`. Race gone.
+
+### Q: What's the underlying pattern?
+
+**Expand the atomic boundary.** When single atomic ops aren't enough (because you branch on data), wrap the whole read-modify-write into one atomic block. Same pattern as DB transactions, CAS, optimistic locking.
+
+---
+
+## 8. The 429 Response
+
+### Q: Queue or fail fast?
+
+**Fail fast.** Queuing creates memory pressure, unpredictable latency, and users retry anyway.
+
+### Q: What headers should the 429 include?
+
+```
+HTTP/1.1 429 Too Many Requests
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1640995200
+Retry-After: 60
+```
+
+Lets well-behaved clients back off intelligently instead of hammering with retries.
+
+---
+
+## 9. Scaling to 1M RPS
+
+### Q: What's the bottleneck?
+
+One Redis instance = ~100k-200k ops/sec. Each rate check = 1 op minimum. So one Redis caps at ~100k rate checks/sec, 10× short of our 1M rps target.
+
+### Q: How do we shard?
+
+**Consistent hashing on the client ID.** Each client's state must always land on the same shard, or the algorithm breaks.
+
+```
+hash("alice") % 10 → shard 3   (always)
+hash("bob")   % 10 → shard 7   (always)
+```
+
+10 shards × ~100k ops/sec = 1M rps.
+
+### Q: How is this implemented in practice?
+
+**Redis Cluster** — auto-distributes across 16,384 hash slots. No custom hashing in gateway code; just connect.
+
+---
+
+## 10. High Availability
+
+### Q: Fail open or fail closed when Redis dies?
+
+| Mode | Behavior | When to use |
+|------|----------|-------------|
+| Fail open | Allow all requests | Availability > protection |
+| **Fail closed** ✅ | Reject all requests | Protection > availability (our choice) |
+
+Why closed for social media: rate limiter failures often coincide with traffic spikes (that's what caused them). Fail open during a viral event = flood hits DBs = full outage.
+
+### Q: How do we prevent Redis failures?
+
+Master-replica replication per shard. Redis Cluster auto-detects master failure and promotes a replica. Trade-off: replication lag (fine for eventual consistency) + doubled infra cost.
+
+---
+
+## 11. Latency Optimizations
+
+### Q: What are the two biggest latency wins?
+
+| Optimization | Savings | Effort |
+|--------------|---------|--------|
+| **Connection pooling** | 20-50ms per check (skip TCP handshake) | Near-zero — client libs do it |
+| **Geographic distribution** | 50-300ms per check | High — infra work |
+
+### Q: How does connection pooling work?
+
+Gateway keeps a stash of persistent open TCP connections to Redis. Each request borrows one from the pool, uses it, returns it. Skips the 20-50ms TCP handshake per request.
+
+Rule of thumb: `pool_size ≈ p99_concurrent_requests × 1.5`.
+
+### Q: How does geo-distribution work?
+
+Deploy gateways + Redis in every region. Route users via DNS (Route 53, Cloudflare).
+
+```
+Tokyo user  → Tokyo Gateway  → Tokyo Redis     (5ms)
+NYC user    → NYC Gateway    → NYC Redis       (5ms)
+```
+
+Cross-continent Redis would be 150ms — 15× over budget.
+
+### Q: What about consistency across regions?
+
+Each region has independent bucket state. Alice can theoretically make N × region-limit requests globally. For social media we accept this. For strict global limits, you'd need cross-region sync (CRDTs, centralized coord) — big latency cost.
+
+---
+
+## 12. Hot Keys
+
+### Q: What's a hot key?
+
+One client so aggressive they overwhelm a single shard. Sharding doesn't help — all their requests hash to the same shard.
+
+### Q: How do we handle legitimate hot clients?
+
+Analytics pipelines, mobile apps, enterprise integrations.
+
+- **Client-side rate limiting**: SDKs self-throttle from response headers
+- **Batching**: 100 ops in 1 API call
+- **Premium tiers**: higher limits, potentially dedicated infra
+
+### Q: How do we handle abusive hot clients?
+
+- **Automatic blocklist** after N violations — kept in a dedicated Redis shard
+- **DDoS shield** upstream (Cloudflare, AWS Shield) blocks before hitting the gateway
+
+---
+
+## 13. Dynamic Rule Config
+
+### Q: How do rules get updated without redeploying?
+
+| Approach | How | Trade-off |
+|----------|-----|-----------|
+| **Pull (polling)** ✅ | Gateways poll config DB every 30s | Simple, 30s propagation delay |
+| Push (ZooKeeper / pub-sub) | Config service pushes updates | Near-instant, complex |
+
+Default to polling. Only use push for scenarios needing near-instant updates (active DDoS mitigation).
+
+---
+
+## 14. Real-World Setup
+
+### Q: Do we actually write rate limiter code?
+
+Usually no. 99% of companies use off-the-shelf gateways (Kong, Envoy, AWS API Gateway) with built-in rate limiting plugins.
+
+### Q: What do we configure vs write?
+
+| What | Language | Who |
+|------|----------|-----|
+| Gateway config (rules, plugins) | YAML/JSON | Platform team |
+| Custom business rules | Lua (Kong) / Go microservice (Envoy RLS) | Backend team |
+| Actual limit values | Admin UI | Product/Ops |
+
+Real setup:
+
+```
+Cloudflare (DDoS shield)
+   ↓
+Envoy API Gateway (rate limit plugin)
+   ↓ complex rules
+Rate Limit Service (custom Go microservice)
+   ↓
+Redis Cluster (10 shards, master-replica)
+```
+
+You write ~50 lines of YAML, not 5000 lines of algorithm code.
+
+---
+
+## 15. Interview One-Liners
+
+### "Walk me through the design."
+> "API Gateway placement, stack rules by user ID / IP / API key, Token Bucket algorithm, sharded Redis for state, Lua scripts for atomic updates, HTTP 429 + headers on reject."
+
+### "Why Token Bucket?"
+> "Handles bursts + sustained rate naturally, tiny memory (2 fields per user), and two intuitive knobs — bucket size and refill rate. Stripe uses it in production."
+
+### "How do you fix the race condition?"
+> "Lua scripts in Redis. Redis runs them atomically and single-threaded, so read-compute-write happens without interleaving."
+
+### "How do you scale to 1M rps?"
+> "Shard Redis by client ID via Redis Cluster. Ten shards × 100k ops/sec = 1M rps."
+
+### "Fail open or fail closed?"
+> "Fail closed for social media. Rate limiter failures usually coincide with traffic spikes, and failing open turns an outage into a cascade."
+
+### "How do you stay under 10ms latency?"
+> "Connection pooling (skips 20-50ms TCP handshake) and geo-distribution (regional Redis instead of cross-continent)."
+
+### "How do you handle hot keys?"
+> "Client-side throttling and batching for legitimate high-volume clients; automatic blocklists and upstream DDoS shield for abuse."
+
+---
+
+## 16. Decision Cheat Sheet
+
+| Layer | Decision |
+|-------|----------|
+| Placement | API Gateway |
+| Client ID | User ID / IP / API Key, stacked; strictest wins |
+| Algorithm | Token Bucket |
+| Storage | Redis, sharded by client ID |
+| Concurrency | Lua scripts (atomic read-compute-write) |
+| Rejection | HTTP 429 + `X-RateLimit-*` headers, fail fast |
+| Scale | Redis Cluster with ~10 shards |
+| HA | Master-replica per shard + fail closed |
+| Latency | Connection pooling + geo-distribution |
+| Hot keys | Client SDK throttling + blocklist + DDoS shield |
+| Dynamic config | Polling every 30s |
+
+### Full Architecture
+
+```
+Users → Cloudflare (DDoS) → Regional Gateways → Regional Redis Cluster
+                                                  (10 shards, master-replica)
+```
+
+---
+
+## 17. Mental Models
+
+| Concept | Analogy |
+|---------|---------|
+| Rate limiter | Bouncer at a nightclub with a clicker counter |
+| Token Bucket | Leaky faucet dripping into a bucket; each request grabs a marble |
+| Fixed Window boundary burst | "10 drinks per hour" rule — down 10 at 8:59, 10 more at 9:00 |
+| Lazy refill | Don't watch the bucket; calculate the level when someone shows up |
+| Race condition | Two chefs opening the fridge at once, both taking the last egg |
+| Lua script atomicity | Send the whole recipe to the kitchen and lock the door |
+| Redis sharding | Multiple fridges; a rule says which fridge holds each ingredient |
+| Fail closed | If the doorman can't check reservations, no one gets in |
+| Connection pooling | Keep the phone line open instead of redialing every sentence |
+| Geo-distribution | Local branch office vs routing every question to headquarters |
+| API Gateway | Restaurant hostess — checks reservations, tells you the wait, seats you |
+
+---
+
+## 18. What's Next
+
+- **Consistent Hashing** — the algorithm behind Redis sharding
+- **Circuit Breaker Pattern** — related resilience pattern for protecting downstream services
+- **DDoS Mitigation** — how Cloudflare / AWS Shield work at the edge
+- **API Gateway Deep Dive** — Envoy vs Kong vs AWS API Gateway
+
+---
+
+*Session on rate limiter system design. For L1/L2 backend interview prep.*
